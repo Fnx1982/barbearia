@@ -1,16 +1,17 @@
 // =====================================================================
-//  api.js — camada de dados do site.   versão 3
-//  • Com APP_CONFIG.API_URL preenchido: conversa com o Worker (produção).
-//  • Com API_URL vazio: MODO DEMONSTRAÇÃO, dados salvos só neste navegador.
+//  api.js — conversa com o Worker (backend).   versão 4
+//  O endereço do Worker fica no config.js (API_URL).
 // =====================================================================
 (function () {
   'use strict';
   const CFG = window.APP_CONFIG || {};
-  const API = String(CFG.API_URL || '').replace(/\/+$/, '');
-  const DEMO = !API;
+  const API = String(CFG.API_URL || (CFG.TRANSPORTE ? 'https://demo.local' : '')).replace(/\/+$/, '');
+  const transporte = CFG.TRANSPORTE || ((url, init) => fetch(url, init));
 
   // ===== REGRAS COMPARTILHADAS — idênticas no site (api.js) e no Worker =====
 const FORMAS = { pix: 'Pix', dinheiro: 'Dinheiro', debito: 'Cartão de débito', credito: 'Cartão de crédito', outro: 'Outro' };
+const CATEGORIAS_DESPESA = ['Aluguel', 'Energia', 'Água', 'Internet e telefone', 'Produtos e estoque', 'Manutenção', 'Limpeza', 'Marketing', 'Impostos e taxas', 'Taxas de cartão', 'Salários e pró-labore', 'Equipamentos', 'Outros'];
+const CATEGORIAS_PRODUTO = { bebida: 'Bebida', produto: 'Produto de venda', insumo: 'Insumo (uso interno)', outro: 'Outro' };
 function toMin(h) { if (!h) return 0; const [a, b] = String(h).split(':').map(Number); return a * 60 + (b || 0); }
 function soDigitos(s) { return String(s || '').replace(/\D/g, ''); }
 function ehData(s) { return typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s); }
@@ -88,28 +89,45 @@ function checarFinalizar(a, por, hoje) {
   if (por === 'barbeiro' && a.conferido) throw new Error('Esse atendimento já foi conferido pela gerência.');
   if (por === 'barbeiro' && a.data > hoje) throw new Error('Só dá para finalizar atendimentos de hoje ou de dias anteriores.');
 }
+function totalItens(a) { return soma((a.itens || []).map(i => i.preco * i.qtd)); }
+function calcPagamento(a, pct, valorServico, forma, obs, por, quando) {
+  const vs = Math.max(0, r2(valorServico)), vi = totalItens(a);
+  const cs = r2(vs * pct / 100), ci = soma((a.itens || []).map(i => i.preco * i.qtd * (Number(i.comissao) || 0) / 100));
+  return { forma, valorServico: vs, valorItens: vi, valor: r2(vs + vi), comissaoPct: pct, comissaoServico: cs, comissaoItens: ci, comissaoValor: r2(cs + ci), obs, finalizadoEm: quando, finalizadoPor: por };
+}
 function aplicarFinalizacao(a, b, d, por) {
-  const bruto = d.valor === '' || d.valor === undefined || d.valor === null ? a.total : d.valor;
-  const valor = Math.max(0, r2(bruto));
-  const pct = pctComissao(b);
+  const bruto = d.valorServico !== undefined ? d.valorServico : d.valor;
+  const vs = bruto === '' || bruto === undefined || bruto === null ? a.total : bruto;
   return {
     ...a, status: 'concluido', conferido: false,
-    pagamento: {
-      forma: FORMAS[d.forma] ? d.forma : 'outro', valor, comissaoPct: pct, comissaoValor: r2(valor * pct / 100),
-      obs: String(d.obs || '').trim().slice(0, 200), finalizadoEm: new Date().toISOString(), finalizadoPor: por,
-    },
+    pagamento: calcPagamento(a, pctComissao(b), vs, FORMAS[d.forma] ? d.forma : 'outro', String(d.obs || '').trim().slice(0, 200), por, new Date().toISOString()),
   };
 }
+function recalcularPagamento(a) {
+  if (!a.pagamento) return a;
+  const p = a.pagamento, vs = p.valorServico !== undefined ? p.valorServico : p.valor;
+  return { ...a, pagamento: calcPagamento(a, p.comissaoPct, vs, p.forma, p.obs || '', p.finalizadoPor, p.finalizadoEm) };
+}
 function checarStatus(a, status, por) {
-  const ok = por === 'barbeiro' ? ['confirmado', 'faltou'] : ['confirmado', 'faltou', 'cancelado'];
-  if (!ok.includes(status)) throw new Error('Status inválido.');
+  if (!['confirmado', 'faltou', 'cancelado'].includes(status)) throw new Error('Status inválido.');
   if (por === 'barbeiro' && a.conferido) throw new Error('Esse atendimento já foi conferido pela gerência.');
-  if (por === 'barbeiro' && a.status === 'cancelado') throw new Error('Agendamento cancelado pela barbearia.');
+}
+function checarComanda(a, por) {
+  if (a.status === 'cancelado' || a.status === 'faltou') throw new Error('Comanda fechada: o agendamento foi cancelado ou o cliente faltou.');
+  if (por === 'barbeiro' && a.conferido) throw new Error('Esse atendimento já foi conferido pela gerência.');
+}
+function checarExcluir(a, por) {
+  if (por === 'barbeiro' && a.status === 'concluido') throw new Error('Atendimento finalizado não pode ser excluído pelo barbeiro. Reabra antes ou peça à gerência.');
+  if (por === 'barbeiro' && a.conferido) throw new Error('Esse atendimento já foi conferido pela gerência.');
 }
 function mudarStatus(a, status) {
   const n = { ...a, status };
   if (status !== 'concluido') { delete n.pagamento; n.conferido = false; }
   return n;
+}
+function novoItem(p, qtd) {
+  const q = Math.max(1, Math.min(99, parseInt(qtd, 10) || 1));
+  return { id: novoId(), produtoId: p.id, nome: p.nome, categoria: p.categoria || 'outro', qtd: q, preco: r2(p.preco), custo: r2(p.custo || 0), comissao: Math.max(0, Math.min(100, Number(p.comissao) || 0)) };
 }
 // pagamento do atendimento (atendimentos antigos, concluídos sem pagamento, usam o valor de tabela)
 function pagDe(a, b) {
@@ -180,7 +198,8 @@ function senhaFraca(s) {
 
   // ------------------------------------------------------- utilidades
   const U = {
-    toMin, soDigitos, fazServicos, limparUsuario, senhaFraca, somarDias, limitesMes, r2, soma, FORMAS, pagDe, pctComissao,
+    toMin, soDigitos, fazServicos, limparUsuario, senhaFraca, somarDias, limitesMes, r2, soma,
+    FORMAS, CATEGORIAS_DESPESA, CATEGORIAS_PRODUTO, pagDe, pctComissao, totalItens,
     toHora(m) { return String(Math.floor(m / 60)).padStart(2, '0') + ':' + String(m % 60).padStart(2, '0'); },
     iso(d) { return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0'); },
     hojeISO() { return U.iso(new Date()); },
@@ -201,153 +220,28 @@ function senhaFraca(s) {
     tamanho(b) { return b > 1048576 ? (b / 1048576).toFixed(1).replace('.', ',') + ' MB' : Math.max(1, Math.round(b / 1024)) + ' KB'; },
   };
 
-  // ------------------------------------------------- modo demonstração
-  const CHAVE = 'barbearia_demo_v3';
-  let mem = null;
-  const ERRO = msg => Promise.reject(new Error(msg));
-
-  function semana() {
-    return [0, 1, 2, 3, 4, 5, 6].map(i => ({
-      aberto: i !== 0, inicio: '09:00', fim: i === 6 ? '17:00' : '19:00',
-      pausaInicio: i === 6 ? '' : '12:00', pausaFim: i === 6 ? '' : '13:00',
-    }));
-  }
-  function seed() {
-    let sem = 11; const rnd = () => (sem = (sem * 16807) % 2147483647) / 2147483647;
-    const pick = l => l[Math.floor(rnd() * l.length)];
-    const s = (nome, duracao, preco, descricao = '') => ({ id: novoId(), nome, descricao, duracao, preco, ativo: true, ordem: 0 });
-    const servicos = [
-      s('Corte de cabelo', 30, 45, 'Máquina e tesoura, com lavagem'), s('Barba', 30, 35, 'Toalha quente e navalha'),
-      s('Corte + barba', 60, 70, 'O combo completo'), s('Sobrancelha', 15, 15), s('Pezinho', 15, 20, 'Acabamento entre cortes'),
-      s('Pigmentação', 30, 40),
-    ];
-    const b1 = { id: novoId(), nome: 'Rafael', bio: 'Degradê e cortes clássicos', foto: '', ativo: true, ordem: 0, comissao: 50, servicos: [], horarios: semana(), usuario: 'rafael', senhaDemo: 'barba1' };
-    const h2 = semana(); h2[1].aberto = false;
-    const b2 = { id: novoId(), nome: 'Lucas', bio: 'Barba e navalha', foto: '', ativo: true, ordem: 1, comissao: 40, servicos: servicos.slice(0, 5).map(x => x.id), horarios: h2, usuario: 'lucas', senhaDemo: 'barba1' };
-    const hoje = U.hojeISO(), agora = U.agoraMin();
-    const nomes = ['Carlos Mendes', 'João Pedro', 'André Silva', 'Marcos Lima', 'Felipe Costa', 'Bruno Alves', 'Diego Rocha', 'Gustavo Reis', 'Thiago Nunes', 'Vinícius Prado', 'Rodrigo Melo', 'Leandro Dias', 'Paulo Henrique', 'Eduardo Faria', 'Igor Matos'];
-    const tels = nomes.map((_, i) => '4199' + String(1000000 + i * 73331).slice(0, 7));
-    const formas = ['pix', 'pix', 'pix', 'dinheiro', 'debito', 'credito'];
-    const agendamentos = [];
-    const ag = (b, sv, data, ini, ci, status) => {
-      const a = {
-        id: novoId(), barbeiroId: b.id, barbeiroNome: b.nome, servicoIds: [sv.id], servicosNome: sv.nome, data,
-        inicio: ini, fim: ini + sv.duracao, duracao: sv.duracao, total: sv.preco, clienteNome: nomes[ci], clienteTelefone: tels[ci],
-        obs: '', status: 'confirmado', origem: rnd() < 0.7 ? 'site' : 'balcao', criadoEm: new Date().toISOString(), conferido: false, anexos: [], obsInterna: '',
-      };
-      if (status === 'concluido') {
-        const f = aplicarFinalizacao(a, b, { forma: pick(formas), valor: rnd() < 0.1 ? sv.preco + 20 : sv.preco }, 'barbeiro');
-        f.conferido = data < somarDias(hoje, -5); return f;
-      }
-      a.status = status; return a;
-    };
-    for (let d = -45; d <= 3; d++) {
-      const data = somarDias(hoje, d), dow = U.diaSemana(data);
-      [b1, b2].forEach(b => {
-        if (!b.horarios[dow].aberto) return;
-        const n = d > 0 ? 2 : 3 + Math.floor(rnd() * 4);
-        const ocup = [];
-        for (let k = 0; k < n; k++) {
-          const sv = pick(b === b2 ? servicos.slice(0, 5) : servicos);
-          const ini = (9 + Math.floor(rnd() * 9)) * 60 + pick([0, 30]);
-          if (ini >= 12 * 60 && ini < 13 * 60) continue;
-          if (ini + sv.duracao > toMin(b.horarios[dow].fim) || ocup.some(([x, y]) => ini < y && ini + sv.duracao > x)) continue;
-          if (ini < 12 * 60 && ini + sv.duracao > 12 * 60) continue;
-          ocup.push([ini, ini + sv.duracao]);
-          const passado = d < 0 || (d === 0 && ini + sv.duracao <= agora);
-          const st = passado ? (rnd() < 0.08 ? 'faltou' : 'concluido') : 'confirmado';
-          agendamentos.push(ag(b, sv, data, ini, Math.floor(rnd() * nomes.length), st));
-        }
-      });
-    }
-    const mesAnt = U.addMes(hoje.slice(0, 7), -1);
-    const pagamentos = [
-      { id: novoId(), barbeiroId: b1.id, barbeiroNome: b1.nome, data: mesAnt + '-05', valor: 900, tipo: 'pagamento', forma: 'pix', obs: '', criadoEm: '' },
-      { id: novoId(), barbeiroId: b2.id, barbeiroNome: b2.nome, data: mesAnt + '-05', valor: 650, tipo: 'pagamento', forma: 'pix', obs: '', criadoEm: '' },
-      { id: novoId(), barbeiroId: b1.id, barbeiroNome: b1.nome, data: hoje.slice(0, 7) + '-05', valor: 600, tipo: 'pagamento', forma: 'pix', obs: 'Fechamento do mês anterior', criadoEm: '' },
-      { id: novoId(), barbeiroId: b2.id, barbeiroNome: b2.nome, data: hoje.slice(0, 7) + '-02', valor: 150, tipo: 'vale', forma: 'dinheiro', obs: 'Adiantamento', criadoEm: '' },
-    ].filter(p => p.data <= hoje);
-    return {
-      config: {
-        nome: 'Barbearia Modelo', slogan: 'Corte, barba e cuidado — com hora marcada.', logo: '', cor: '#c8102e',
-        whatsapp: '5541999990000', telefone: '(41) 3333-0000', endereco: 'Rua Exemplo, 123 — Centro', mapa: '',
-        instagram: 'barbeariamodelo', sobre: 'Ambiente climatizado, café por nossa conta e Wi-Fi liberado. Aceitamos Pix e cartões.',
-        grade: 15, antecedencia: 60, diasAFrente: 30, fuso: 'America/Sao_Paulo',
-      },
-      servicos, barbeiros: [b1, b2], pagamentos, tentativas: {},
-      bloqueios: [{ id: novoId(), barbeiroId: b2.id, data: somarDias(hoje, 4), dataFim: somarDias(hoje, 4), diaInteiro: true, inicio: '', fim: '', motivo: 'Folga' }],
-      agendamentos,
-    };
-  }
-  function db() {
-    if (mem) return mem;
-    try { const s = localStorage.getItem(CHAVE); if (s) return (mem = JSON.parse(s)); } catch (e) { /* sem storage */ }
-    mem = seed(); gravar(); return mem;
-  }
-  function gravar() { try { localStorage.setItem(CHAVE, JSON.stringify(mem)); } catch (e) { /* cheio ou bloqueado */ } }
-  const copia = x => JSON.parse(JSON.stringify(x));
-  const ok = v => new Promise(r => setTimeout(() => r(copia(v)), 100));
-  const tenta = fn => { try { return ok(fn()); } catch (e) { return Promise.reject(e); } };
-  const semAcesso = (b, admin) => { const { senhaDemo, ...r } = b; if (!admin) { delete r.usuario; delete r.ultimoAcesso; return r; } const t = (db().tentativas || {})['barb:' + b.usuario]; return { ...r, temAcesso: !!senhaDemo, bloqueadoAte: t && t.bloqueadoAte > Date.now() ? t.bloqueadoAte : 0 }; };
-  const semAnexos = a => { const { anexos, obsInterna, ...r } = a; return { ...r, qtdAnexos: (anexos || []).length }; };
-  const achar = id => { const a = db().agendamentos.find(x => x.id === id); if (!a) throw new Error('Agendamento não encontrado.'); return a; };
-  const trocar = n => { const D = db(); D.agendamentos[D.agendamentos.findIndex(x => x.id === n.id)] = n; gravar(); return n; };
-
-  function finDemo(mes, so) {
-    const D = db(), [ini, fim] = limitesMes(mes);
-    const ags = D.agendamentos.filter(a => a.data >= ini && a.data <= fim && (!so || a.barbeiroId === so));
-    const pags = D.pagamentos.filter(p => p.data >= ini && p.data <= fim && (!so || p.barbeiroId === so)).sort((a, b) => a.data < b.data ? -1 : 1);
-    const ant = acumularAnteriores(
-      D.agendamentos.filter(a => a.status === 'concluido' && a.data < ini && (!so || a.barbeiroId === so)).map(a => ({ barbeiroId: a.barbeiroId, comissaoValor: a.pagamento ? a.pagamento.comissaoValor : null, total: a.total })),
-      D.pagamentos.filter(p => p.data < ini && (!so || p.barbeiroId === so)), D.barbeiros);
-    const lista = so ? D.barbeiros.filter(b => b.id === so) : D.barbeiros;
-    return { mes, resumo: resumoFinanceiro(lista, ags, pags, ant), pagamentos: pags };
-  }
-
-  const demo = {
-    publico() { const D = db(); return ok({ config: D.config, servicos: D.servicos.filter(s => s.ativo), barbeiros: D.barbeiros.filter(b => b.ativo).map(b => { const r = semAcesso(b); delete r.comissao; return r; }) }); },
-    ocupados(data) {
-      const D = db();
-      return ok({
-        ocupados: D.agendamentos.filter(a => a.data === data && a.status !== 'cancelado').map(a => ({ barbeiroId: a.barbeiroId, inicio: a.inicio, fim: a.fim })),
-        bloqueios: D.bloqueios.filter(b => b.data <= data && b.dataFim >= data),
-      });
-    },
-    agendar(d, admin) {
-      if (!admin && d.site) return ERRO('Não foi possível agendar.');
-      return tenta(() => {
-        const D = db(), hoje = U.hojeISO();
-        const ag = montarAgendamento({
-          config: D.config, servicos: D.servicos, barbeiros: D.barbeiros, bloqueios: D.bloqueios,
-          ocupados: D.agendamentos.filter(a => a.data === d.data && a.status !== 'cancelado'),
-          futurosDoTelefone: D.agendamentos.filter(a => a.clienteTelefone === soDigitos(d.clienteTelefone) && a.status === 'confirmado' && a.data >= hoje).length,
-        }, d, admin, hoje, U.agoraMin());
-        D.agendamentos.push(ag); gravar(); return ag;
-      });
-    },
-  };
-
-  // ------------------------------------------------------- servidor
+  // ------------------------------------------------------- sessões
   const SESS = { adm: 'barb_sess_adm', barb: 'barb_sess_barb' };
   const memSess = {};
-  function lerSess(p) { try { const s = sessionStorage.getItem(SESS[p]) || localStorage.getItem(SESS[p]); if (s) return JSON.parse(s); } catch (e) { /* */ } return memSess[p] || null; }
+  function lerSess(p) { try { const s = sessionStorage.getItem(SESS[p]) || localStorage.getItem(SESS[p]); if (s) return JSON.parse(s); } catch (e) { /* sem storage */ } return memSess[p] || null; }
   function gravarSess(p, v, lembrar) {
     memSess[p] = v;
     try {
       sessionStorage.removeItem(SESS[p]); localStorage.removeItem(SESS[p]);
       if (v) (lembrar ? localStorage : sessionStorage).setItem(SESS[p], JSON.stringify(v));
-    } catch (e) { /* */ }
+    } catch (e) { /* sem storage */ }
   }
 
   async function req(metodo, caminho, corpo, papel, extra = {}) {
+    if (!API) throw new Error('Site sem servidor configurado: preencha API_URL no config.js.');
     const h = {};
     if (papel) { const s = lerSess(papel); h.Authorization = 'Bearer ' + (s ? s.token : ''); }
     let body;
     if (extra.arquivo) { body = extra.arquivo; h['Content-Type'] = extra.arquivo.type || 'application/octet-stream'; h['X-Nome-Arquivo'] = encodeURIComponent(extra.arquivo.name || 'arquivo'); }
     else if (corpo) { body = JSON.stringify(corpo); h['Content-Type'] = 'application/json'; }
     let r;
-    try { r = await fetch(API + caminho, { method: metodo, headers: h, body }); }
-    catch (e) { throw new Error('Sem conexão com o servidor. Tente de novo.'); }
+    try { r = await transporte(API + caminho, { method: metodo, headers: h, body }); }
+    catch (e) { throw new Error('Sem conexão com o servidor. Confira a internet e tente de novo.'); }
     if (extra.blob && r.ok) return r.blob();
     const j = await r.json().catch(() => ({}));
     if (r.status === 401 && papel) { gravarSess(papel, null); const e = new Error(j.erro || 'Sessão expirada.'); e.auth = true; throw e; }
@@ -355,142 +249,75 @@ function senhaFraca(s) {
     return j;
   }
   const adm = (m, c, b, x) => req(m, c, b, 'adm', x);
-  const brb = (m, c, b) => req(m, c, b, 'barb');
-
-  function sessDemoBarb() { const s = lerSess('barb'); const b = s && db().barbeiros.find(x => x.id === s.id && x.ativo && x.senhaDemo); if (!b) { gravarSess('barb', null); const e = new Error('Sessão expirada.'); e.auth = true; throw e; } return b; }
-
-  // ------------------------------------------------------- interface
-  function upsert(lista, obj) { const i = lista.findIndex(x => x.id === obj.id); i >= 0 ? (lista[i] = obj) : lista.push(obj); }
-  const lerArquivoURL = f => new Promise((res, rej) => { const fr = new FileReader(); fr.onload = () => res(fr.result); fr.onerror = () => rej(new Error('Não foi possível ler o arquivo.')); fr.readAsDataURL(f); });
-  function dataURLparaBlob(u) { const [cab, b64] = u.split(','); const tipo = cab.slice(5).split(';')[0]; const bin = atob(b64); const a = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) a[i] = bin.charCodeAt(i); return new Blob([a], { type: tipo }); }
+  const brb = (m, c, b, x) => req(m, c, b, 'barb', x);
+  const qs = o => Object.entries(o).filter(([, v]) => v !== undefined && v !== '').map(([k, v]) => k + '=' + encodeURIComponent(v)).join('&');
 
   window.U = U;
   window.horariosLivres = horariosLivres;
   window.Api = {
-    demo: DEMO,
-    publico: () => DEMO ? demo.publico() : req('GET', '/api/publico'),
-    ocupados: data => DEMO ? demo.ocupados(data) : req('GET', '/api/ocupados?data=' + encodeURIComponent(data)),
-    agendar: d => DEMO ? demo.agendar(d, false) : req('POST', '/api/agendamentos', d),
+    demo: !!CFG.DEMO,
+    publico: () => req('GET', '/api/publico'),
+    ocupados: data => req('GET', '/api/ocupados?data=' + encodeURIComponent(data)),
+    agendar: d => req('POST', '/api/agendamentos', d),
 
     sessao: p => lerSess(p),
     sair: p => gravarSess(p, null),
     async login(d) {
       const papel = d.papel === 'barb' ? 'barb' : 'adm';
-      if (DEMO) {
-        const D = db(), agora = Date.now(); D.tentativas = D.tentativas || {};
-        const usuario = limparUsuario(d.usuario), chave = papel === 'barb' ? 'barb:' + usuario : 'adm';
-        const t0 = D.tentativas[chave];
-        if (t0 && t0.bloqueadoAte > agora) throw new Error(msgBloqueio(t0.bloqueadoAte, agora));
-        const b = papel === 'barb' ? D.barbeiros.find(x => x.usuario === usuario && x.ativo && x.senhaDemo) : null;
-        const ok = papel === 'adm' ? d.senha === 'admin' : !!(b && b.senhaDemo === d.senha);
-        if (!ok) {
-          const c = avaliarFalha(t0, agora, 5); D.tentativas[chave] = c.t; gravar();
-          await new Promise(r => setTimeout(r, 400));
-          if (c.t.bloqueadoAte > agora) throw new Error(msgBloqueio(c.t.bloqueadoAte, agora));
-          throw new Error((papel === 'adm' ? 'Senha incorreta.' : 'Usuário ou senha incorretos.') + (c.restantes <= 2 ? ` Mais ${c.restantes} erro(s) e o acesso será bloqueado por um tempo.` : '') + (papel === 'adm' ? ' (demonstração: admin)' : ' (demonstração: rafael / barba1)'));
-        }
-        delete D.tentativas[chave];
-        if (b) b.ultimoAcesso = new Date().toISOString();
-        gravar();
-        gravarSess(papel, papel === 'adm' ? { token: 'demo', nome: 'Administrador' } : { token: 'demo', id: b.id, nome: b.nome }, d.lembrar); return;
-      }
       const r = await req('POST', '/api/login', { papel, senha: d.senha, usuario: d.usuario, lembrar: !!d.lembrar });
       gravarSess(papel, { token: r.token, id: r.id, nome: r.nome }, d.lembrar);
     },
 
     // ---------- área do barbeiro ----------
     barb: {
-      inicio() { if (!DEMO) return brb('GET', '/api/barbeiro/inicio'); return tenta(() => { const D = db(), b = sessDemoBarb(); return { config: D.config, barbeiro: semAcesso(b, true), servicos: D.servicos.filter(s => s.ativo) }; }); },
-      agendamentos(de, ate) { if (!DEMO) return brb('GET', `/api/barbeiro/agendamentos?de=${de}&ate=${ate || de}`); return tenta(() => { const b = sessDemoBarb(); return db().agendamentos.filter(a => a.barbeiroId === b.id && a.data >= de && a.data <= (ate || de)).sort((x, y) => x.data === y.data ? x.inicio - y.inicio : x.data < y.data ? -1 : 1).map(semAnexos); }); },
-      finalizar(id, d) { if (!DEMO) return brb('POST', `/api/barbeiro/agendamentos/${id}/finalizar`, d); return tenta(() => { const b = sessDemoBarb(), a = achar(id); if (a.barbeiroId !== b.id) throw new Error('Esse atendimento não é seu.'); checarFinalizar(a, 'barbeiro', U.hojeISO()); return semAnexos(trocar(aplicarFinalizacao(a, b, d, 'barbeiro'))); }); },
-      status(id, status) { if (!DEMO) return brb('PATCH', `/api/barbeiro/agendamentos/${id}`, { status }); return tenta(() => { const b = sessDemoBarb(), a = achar(id); if (a.barbeiroId !== b.id) throw new Error('Esse atendimento não é seu.'); checarStatus(a, status, 'barbeiro'); return semAnexos(trocar(mudarStatus(a, status))); }); },
-      financeiro(mes) { if (!DEMO) return brb('GET', `/api/barbeiro/financeiro?mes=${mes}`); return tenta(() => { const b = sessDemoBarb(), f = finDemo(mes, b.id); return { resumo: f.resumo.find(r => r.barbeiroId === b.id) || null, pagamentos: f.pagamentos }; }); },
+      inicio: () => brb('GET', '/api/barbeiro/inicio'),
+      agendamentos: (de, ate) => brb('GET', `/api/barbeiro/agendamentos?${qs({ de, ate: ate || de })}`),
+      criar: d => brb('POST', '/api/barbeiro/agendamentos', d),
+      finalizar: (id, d) => brb('POST', `/api/barbeiro/agendamentos/${id}/finalizar`, d),
+      status: (id, status) => brb('PATCH', `/api/barbeiro/agendamentos/${id}`, { status }),
+      excluir: id => brb('DELETE', `/api/barbeiro/agendamentos/${id}`),
+      addItem: (id, d) => brb('POST', `/api/barbeiro/agendamentos/${id}/itens`, d),
+      remItem: (id, itemId) => brb('DELETE', `/api/barbeiro/agendamentos/${id}/itens/${itemId}`),
+      bloqueios: () => brb('GET', '/api/barbeiro/bloqueios'),
+      salvarBloqueio: b => brb('POST', '/api/barbeiro/bloqueios', b),
+      excluirBloqueio: id => brb('DELETE', '/api/barbeiro/bloqueios/' + id),
+      financeiro: mes => brb('GET', `/api/barbeiro/financeiro?mes=${mes}`),
+      anexoPagamento: (pgId, anId) => brb('GET', `/api/barbeiro/pagamentos/${pgId}/anexos/${anId}`, null, { blob: true }),
     },
 
     // ---------- administrador ----------
     admin: {
-      dados() { if (!DEMO) return adm('GET', '/api/admin/dados'); const D = db(); return ok({ config: D.config, servicos: D.servicos, barbeiros: D.barbeiros.map(b => semAcesso(b, true)), bloqueios: D.bloqueios.filter(b => b.dataFim >= somarDias(U.hojeISO(), -30)) }); },
-      agendamentos(de, ate) { if (!DEMO) return adm('GET', `/api/admin/agendamentos?de=${de}&ate=${ate || de}`); return ok(db().agendamentos.filter(a => a.data >= de && a.data <= (ate || de)).sort((x, y) => x.data === y.data ? x.inicio - y.inicio : x.data < y.data ? -1 : 1)); },
-      balcao: d => DEMO ? demo.agendar(d, true) : adm('POST', '/api/admin/agendamentos', d),
-      finalizar(id, d) { if (!DEMO) return adm('POST', `/api/admin/agendamentos/${id}/finalizar`, d); return tenta(() => { const a = achar(id); checarFinalizar(a, 'admin', U.hojeISO()); return trocar(aplicarFinalizacao(a, db().barbeiros.find(b => b.id === a.barbeiroId), d, 'admin')); }); },
-      atualizar(id, d) {
-        if (!DEMO) return adm('PATCH', `/api/admin/agendamentos/${id}`, d);
-        return tenta(() => {
-          const D = db(); let a = achar(id);
-          if (d.status && d.status !== a.status) {
-            checarStatus(a, d.status, 'admin');
-            if (a.status === 'cancelado' && D.agendamentos.some(x => x.id !== id && x.barbeiroId === a.barbeiroId && x.data === a.data && x.status !== 'cancelado' && x.inicio < a.fim && x.fim > a.inicio)) throw new Error('Esse horário já foi ocupado por outro cliente.');
-            a = mudarStatus(a, d.status);
-          }
-          if (typeof d.conferido === 'boolean') { if (d.conferido && a.status !== 'concluido') throw new Error('Só dá para conferir atendimento finalizado.'); a = { ...a, conferido: d.conferido, conferidoEm: d.conferido ? new Date().toISOString() : '' }; }
-          if (typeof d.obsInterna === 'string') a = { ...a, obsInterna: d.obsInterna.slice(0, 500) };
-          return trocar(a);
-        });
-      },
-      async anexar(id, arquivo) {
-        if (!DEMO) return adm('POST', `/api/admin/agendamentos/${id}/anexos`, null, { arquivo });
-        if (arquivo.size > 1.5 * 1024 * 1024) throw new Error('Na demonstração o limite é 1,5 MB por arquivo (no site real, 8 MB).');
-        const url = await lerArquivoURL(arquivo), a = achar(id);
-        if ((a.anexos || []).length >= 10) throw new Error('Limite de 10 arquivos por atendimento.');
-        a.anexos = [...(a.anexos || []), { id: novoId(), nome: arquivo.name, tipo: arquivo.type, tamanho: arquivo.size, criadoEm: new Date().toISOString(), url }];
-        gravar(); return copia(a);
-      },
-      async anexo(agId, anId) {
-        if (!DEMO) return adm('GET', `/api/admin/agendamentos/${agId}/anexos/${anId}`, null, { blob: true });
-        const an = (achar(agId).anexos || []).find(x => x.id === anId); if (!an) throw new Error('Arquivo não encontrado.');
-        return dataURLparaBlob(an.url);
-      },
-      excluirAnexo(agId, anId) { if (!DEMO) return adm('DELETE', `/api/admin/agendamentos/${agId}/anexos/${anId}`); return tenta(() => { const a = achar(agId); a.anexos = (a.anexos || []).filter(x => x.id !== anId); gravar(); return a; }); },
-      financeiro(mes) { if (!DEMO) return adm('GET', `/api/admin/financeiro?mes=${mes}`); return tenta(() => finDemo(mes, null)); },
-      salvarPagamento(p) {
-        if (!DEMO) return adm('POST', '/api/admin/pagamentos', p);
-        return tenta(() => {
-          const b = db().barbeiros.find(x => x.id === p.barbeiroId); if (!b) throw new Error('Barbeiro não encontrado.');
-          const pg = { id: p.id || novoId(), barbeiroId: b.id, barbeiroNome: b.nome, data: p.data || U.hojeISO(), valor: r2(p.valor), tipo: p.tipo === 'vale' ? 'vale' : 'pagamento', forma: p.forma || 'pix', obs: String(p.obs || '').slice(0, 200), criadoEm: new Date().toISOString() };
-          if (!(pg.valor > 0)) throw new Error('Informe um valor maior que zero.');
-          upsert(db().pagamentos, pg); gravar(); return pg;
-        });
-      },
-      excluirPagamento(id) { if (!DEMO) return adm('DELETE', '/api/admin/pagamentos/' + id); const D = db(); D.pagamentos = D.pagamentos.filter(p => p.id !== id); gravar(); return ok({ ok: true }); },
-      salvarConfig(c) { if (!DEMO) return adm('PUT', '/api/admin/config', c); db().config = c; gravar(); return ok(c); },
-      salvarServico(s) { if (!DEMO) return adm('POST', '/api/admin/servicos', s); if (!s.id) s.id = novoId(); upsert(db().servicos, s); gravar(); return ok(s); },
-      excluirServico(id) { if (!DEMO) return adm('DELETE', '/api/admin/servicos/' + id); const D = db(); D.servicos = D.servicos.filter(s => s.id !== id); gravar(); return ok({ ok: true }); },
-      salvarBarbeiro(b) {
-        if (!DEMO) return adm('POST', '/api/admin/barbeiros', b);
-        return tenta(() => {
-          const D = db(), antigo = D.barbeiros.find(x => x.id === b.id);
-          const { novaSenha, removerAcesso, temAcesso, ...n } = b;
-          if (!n.id) n.id = novoId();
-          n.comissao = pctComissao(n);
-          delete n.bloqueadoAte;
-          n.usuario = limparUsuario(n.usuario);
-          if (antigo && antigo.senhaDemo) n.senhaDemo = antigo.senhaDemo;
-          if (antigo && antigo.ultimoAcesso) n.ultimoAcesso = antigo.ultimoAcesso;
-          if (n.usuario && n.usuario.length < 3) throw new Error('O usuário precisa ter pelo menos 3 letras ou números.');
-          const outro = n.usuario && D.barbeiros.find(x => x.usuario === n.usuario && x.id !== n.id);
-          if (outro) throw new Error(`O usuário "${n.usuario}" já é do ${outro.nome}. Escolha outro.`);
-          if (novaSenha) { const fraca = senhaFraca(novaSenha); if (fraca) throw new Error(fraca); if (!n.usuario) throw new Error('Defina o usuário de acesso junto com a senha.'); n.senhaDemo = String(novaSenha); }
-          if (removerAcesso) delete n.senhaDemo;
-          upsert(D.barbeiros, n); gravar(); return semAcesso(n, true);
-        });
-      },
-      desbloquear(id) { if (!DEMO) return adm('POST', `/api/admin/barbeiros/${id}/desbloquear`); const D = db(), b = D.barbeiros.find(x => x.id === id); if (b && D.tentativas) delete D.tentativas['barb:' + b.usuario]; gravar(); return ok({ ok: true }); },
-      excluirBarbeiro(id) {
-        if (!DEMO) return adm('DELETE', '/api/admin/barbeiros/' + id);
-        const D = db(), hoje = U.hojeISO(); let n = 0;
-        D.agendamentos = D.agendamentos.map(a => { if (a.barbeiroId === id && a.data >= hoje && a.status === 'confirmado') { n++; return mudarStatus(a, 'cancelado'); } return a; });
-        D.barbeiros = D.barbeiros.filter(b => b.id !== id); gravar(); return ok({ ok: true, cancelados: n });
-      },
-      salvarBloqueio(b) {
-        if (!DEMO) return adm('POST', '/api/admin/bloqueios', b);
-        if (!b.id) b.id = novoId(); if (!b.dataFim || b.dataFim < b.data) b.dataFim = b.data;
-        if (!b.diaInteiro && (!b.inicio || !b.fim || b.fim <= b.inicio)) return ERRO('Informe um período válido (início antes do fim).');
-        upsert(db().bloqueios, b); gravar();
-        const conflitos = db().agendamentos.filter(a => a.status === 'confirmado' && a.data >= b.data && a.data <= b.dataFim && (!b.barbeiroId || a.barbeiroId === b.barbeiroId) && (b.diaInteiro || (a.inicio < toMin(b.fim) && a.fim > toMin(b.inicio)))).length;
-        return ok({ bloqueio: b, conflitos });
-      },
-      excluirBloqueio(id) { if (!DEMO) return adm('DELETE', '/api/admin/bloqueios/' + id); const D = db(); D.bloqueios = D.bloqueios.filter(b => b.id !== id); gravar(); return ok({ ok: true }); },
-      resetarDemo() { mem = seed(); gravar(); },
+      dados: () => adm('GET', '/api/admin/dados'),
+      agendamentos: (de, ate) => adm('GET', `/api/admin/agendamentos?${qs({ de, ate: ate || de })}`),
+      balcao: d => adm('POST', '/api/admin/agendamentos', d),
+      finalizar: (id, d) => adm('POST', `/api/admin/agendamentos/${id}/finalizar`, d),
+      atualizar: (id, d) => adm('PATCH', `/api/admin/agendamentos/${id}`, d),
+      excluir: id => adm('DELETE', `/api/admin/agendamentos/${id}`),
+      addItem: (id, d) => adm('POST', `/api/admin/agendamentos/${id}/itens`, d),
+      remItem: (id, itemId) => adm('DELETE', `/api/admin/agendamentos/${id}/itens/${itemId}`),
+      // anexos: tipo = 'agendamentos' | 'pagamentos' | 'despesas'
+      anexar: (tipo, id, arquivo) => adm('POST', `/api/admin/${tipo}/${id}/anexos`, null, { arquivo }),
+      anexo: (tipo, id, anId) => adm('GET', `/api/admin/${tipo}/${id}/anexos/${anId}`, null, { blob: true }),
+      excluirAnexo: (tipo, id, anId) => adm('DELETE', `/api/admin/${tipo}/${id}/anexos/${anId}`),
+      financeiro: mes => adm('GET', `/api/admin/financeiro?mes=${mes}`),
+      salvarPagamento: p => adm('POST', '/api/admin/pagamentos', p),
+      excluirPagamento: id => adm('DELETE', '/api/admin/pagamentos/' + id),
+      despesas: (de, ate) => adm('GET', `/api/admin/despesas?${qs({ de, ate })}`),
+      salvarDespesa: d => adm('POST', '/api/admin/despesas', d),
+      excluirDespesa: id => adm('DELETE', '/api/admin/despesas/' + id),
+      salvarProduto: p => adm('POST', '/api/admin/produtos', p),
+      excluirProduto: id => adm('DELETE', '/api/admin/produtos/' + id),
+      movimentos: (de, ate, produto) => adm('GET', `/api/admin/estoque/movimentos?${qs({ de, ate, produto })}`),
+      movimentar: d => adm('POST', '/api/admin/estoque/movimentos', d),
+      salvarConfig: c => adm('PUT', '/api/admin/config', c),
+      salvarServico: s => adm('POST', '/api/admin/servicos', s),
+      excluirServico: id => adm('DELETE', '/api/admin/servicos/' + id),
+      salvarBarbeiro: b => adm('POST', '/api/admin/barbeiros', b),
+      desbloquear: id => adm('POST', `/api/admin/barbeiros/${id}/desbloquear`),
+      excluirBarbeiro: id => adm('DELETE', '/api/admin/barbeiros/' + id),
+      salvarBloqueio: b => adm('POST', '/api/admin/bloqueios', b),
+      excluirBloqueio: id => adm('DELETE', '/api/admin/bloqueios/' + id),
+      resetarDemo: () => { if (CFG.resetarDemo) CFG.resetarDemo(); },
     },
   };
 })();

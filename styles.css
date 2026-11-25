@@ -388,3 +388,95 @@ input[type=checkbox],input[type=radio]{width:20px;height:20px;min-height:0;accen
   .stack td::before{display:none!important}
 }
 .bloq{color:light-dark(#b3261e,#ff8a80)!important}.bloq .link{padding:0 0 0 6px}
+
+/* =================== versão 4: comanda, estoque, despesas, app =================== */
+.comanda-linha{font-size:14px;color:var(--azul)!important;font-weight:500}
+:root[data-theme=dark] .comanda-linha,.adm .comanda-linha{color:light-dark(var(--azul),#9db6ec)!important}
+details.mais{position:relative;display:inline-block}
+details.mais>summary{list-style:none;cursor:pointer;user-select:none}
+details.mais>summary::-webkit-details-marker{display:none}
+details.mais>summary::after{content:"▾";font-size:12px;margin-inline-start:2px}
+.mais-menu{position:absolute;right:0;top:calc(100% + 6px);z-index:15;min-width:210px;background:var(--card);border:1px solid var(--linha);border-radius:12px;box-shadow:0 14px 40px rgba(0,0,0,.22);padding:6px;display:grid}
+.mais-menu button{background:none;border:0;text-align:left;padding:11px 12px;border-radius:8px;cursor:pointer;font-weight:500;min-height:44px;color:var(--ink)}
+.mais-menu button:hover{background:light-dark(#f2f2ef,#26262a)}
+.mais-menu .perigo{color:light-dark(#b3261e,#ff8a80)}
+.ag-acoes{align-items:center}
+.ag-acoes details.mais{flex:0 0 auto}
+.mf-comanda,.mf-total{margin:6px 0}
+.mf-total{font-size:18px}
+.comanda{list-style:none;margin:0 0 14px;padding:0;border:1px solid var(--linha);border-radius:12px;overflow:hidden}
+.comanda li{display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:10px;align-items:center;padding:10px 12px;border-bottom:1px solid var(--linha)}
+.comanda li:last-child{border-bottom:0}
+.comanda .num{font-variant-numeric:tabular-nums;white-space:nowrap}
+.comanda-tot{background:light-dark(#f3f3f0,#212124)}
+.comanda-add{display:grid;grid-template-columns:minmax(0,1fr) 90px auto;gap:10px;align-items:end}
+.filtros{display:flex;flex-wrap:wrap;gap:12px;align-items:end;margin:0 0 16px}
+.filtros label{min-width:160px}
+.filtros .busca{flex:1 1 220px}
+.filtros .check{min-width:0}
+.periodo{display:flex;flex-wrap:wrap;gap:8px;align-items:end}
+.periodo label{display:grid;gap:4px;font-size:13px}
+.periodo input{width:auto;min-height:44px}
+.tabela tr.linha-total td{background:light-dark(#f3f3f0,#212124)}
+.mais-qtd{color:var(--ok)}
+.passos{margin:0;padding-inline-start:20px;display:grid;gap:8px}
+.cal-d.fechado{background:repeating-linear-gradient(-45deg,transparent 0 6px,light-dark(#efefec,#232326) 6px 12px)}
+.cal-d.fechado span{color:var(--sub)}
+.anexar.ocupado{opacity:.6;pointer-events:none}
+.visor img{max-width:100%;max-height:60vh;border-radius:10px;border:1px solid var(--linha);display:block}
+.visor iframe{width:100%;height:60vh;border:1px solid var(--linha);border-radius:10px}
+.visor{margin:10px 0 14px}
+.resultado .kpis{margin-bottom:0}
+.btn-instalar{border-color:var(--acc)!important}
+.tabela .acoes{white-space:nowrap}
+.tabela .acoes details.mais{margin-inline-start:6px}
+@media (max-width:1024px){
+  .adm-topo .topo-in{min-height:58px}
+  .colunas{grid-template-columns:repeat(auto-fit,minmax(min(100%,320px),1fr))}
+}
+@media (max-width:820px){
+  .kpis-6{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .barra h2{font-size:26px}
+  .adm-acoes .btn{padding:0 10px}
+}
+@media (max-width:600px){
+  .comanda-add{grid-template-columns:minmax(0,1fr) 80px}
+  .comanda-add .btn{grid-column:1/-1}
+  .filtros label{min-width:0;flex:1 1 100%}
+  .periodo{width:100%}
+  .periodo label{flex:1}
+  .periodo input{width:100%}
+  .cal-d span i{display:none}
+  .mais-menu{right:auto;left:0}
+  .ag-acoes details.mais{flex:1 1 auto}
+  .ag-acoes details.mais>summary{width:100%}
+  .tabela .acoes{white-space:normal;display:flex!important;flex-wrap:wrap;gap:6px}
+  .tabela .acoes .btn+.btn{margin:0}
+  .tabela .acoes details.mais{margin:0}
+  .stack td.acoes .mais-menu{left:0;right:auto}
+  .adm-acoes .btn-instalar{display:none}
+}
+@media print{
+  .filtros,.periodo,details.mais,.btn-instalar{display:none!important}
+  body.imprimir-extrato .adm-main>*:not(#extrato-est){display:none!important}
+}
+/* tabelas em tablet: vira cartão até 860px; acima disso os botões quebram linha */
+@media (max-width:860px){
+  .stack thead{display:none}
+  .stack tr{display:grid;padding-block:10px;border-bottom:1px solid var(--linha)}
+  .stack td{display:flow-root;border:0;padding:3px 14px;padding-inline-start:calc(14px + 7.5em);text-align:start}
+  .stack td::before{content:attr(data-l);float:inline-start;width:7em;margin-inline-start:-7.5em;color:var(--sub);font-size:13px}
+  .stack td.acoes{padding-inline-start:14px;text-align:start;white-space:normal;display:flex!important;flex-wrap:wrap;gap:6px}
+  .stack td.acoes::before{display:none}
+  .stack td:empty{display:none}
+  .stack .num{text-align:start}
+  .stack tr.linha-total{display:flex;justify-content:space-between}
+  .stack tr.linha-total td{padding-inline-start:14px}
+  .stack tr.linha-total td::before{display:none}
+  .tabela .acoes .btn+.btn,.tabela .acoes details.mais{margin:0}
+}
+@media (min-width:861px) and (max-width:1240px){
+  .tabela th,.tabela td{padding:10px 10px}
+  .tabela .acoes{white-space:normal}
+  .tabela .acoes .btn{margin:2px 0}
+}
