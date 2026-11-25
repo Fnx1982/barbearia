@@ -387,3 +387,4 @@ input[type=checkbox],input[type=radio]{width:20px;height:20px;min-height:0;accen
   .stack td{display:table-cell!important;padding:6px 8px!important}
   .stack td::before{display:none!important}
 }
+.bloq{color:light-dark(#b3261e,#ff8a80)!important}.bloq .link{padding:0 0 0 6px}

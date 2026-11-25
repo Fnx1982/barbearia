@@ -1,5 +1,5 @@
 // =====================================================================
-//  api.js — camada de dados do site.   versão 2
+//  api.js — camada de dados do site.   versão 3
 //  • Com APP_CONFIG.API_URL preenchido: conversa com o Worker (produção).
 //  • Com API_URL vazio: MODO DEMONSTRAÇÃO, dados salvos só neste navegador.
 // =====================================================================
@@ -149,12 +149,38 @@ function resumoFinanceiro(barbeiros, ags, pags, ant) {
   }).filter(r => r.atendimentos || r.pago || r.anterior || barbeiros.some(b => b.id === r.barbeiroId && b.ativo))
     .sort((x, y) => y.produzido - x.produzido);
 }
+// --- segurança de login: bloqueio progressivo por tentativas erradas ---
+const NIVEIS_BLOQUEIO = [15, 60, 1440]; // minutos: 1º bloqueio 15 min, 2º 1 h, 3º em diante 24 h
+const JANELA_TENTATIVAS = 15 * 60000;
+function avaliarFalha(t, agora, limite) {
+  t = t ? { ...t } : { falhas: 0, janela: agora, nivel: 0, bloqueadoAte: 0, ultima: 0 };
+  if (agora - (t.ultima || 0) > 86400000) t.nivel = 0;
+  if (agora - t.janela > JANELA_TENTATIVAS) { t.falhas = 0; t.janela = agora; }
+  t.falhas++; t.ultima = agora;
+  let restantes = limite - t.falhas;
+  if (t.falhas >= limite) {
+    t.bloqueadoAte = agora + NIVEIS_BLOQUEIO[Math.min(t.nivel, NIVEIS_BLOQUEIO.length - 1)] * 60000;
+    t.nivel++; t.falhas = 0; t.janela = agora; restantes = 0;
+  }
+  return { t, restantes };
+}
+function msgBloqueio(ate, agora) {
+  const min = Math.max(1, Math.ceil((ate - agora) / 60000));
+  return 'Muitas tentativas erradas. Acesso bloqueado por ' + (min > 90 ? Math.ceil(min / 60) + ' horas' : min + ' minuto(s)') + '.';
+}
+function limparUsuario(u) { return String(u || '').trim().toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^a-z0-9._-]/g, '').slice(0, 30); }
+function senhaFraca(s) {
+  s = String(s || '');
+  if (s.length < 6) return 'A senha precisa ter pelo menos 6 caracteres.';
+  if (/^(\d)\1+$/.test(s) || ['123456', '1234567', '12345678', '654321', '000000', '111111', 'senha123', 'abc123', 'qwerty'].includes(s.toLowerCase())) return 'Senha fácil demais. Evite sequências e números repetidos.';
+  return '';
+}
 // ===== fim das regras compartilhadas =====
 
 
   // ------------------------------------------------------- utilidades
   const U = {
-    toMin, soDigitos, fazServicos, somarDias, limitesMes, r2, soma, FORMAS, pagDe, pctComissao,
+    toMin, soDigitos, fazServicos, limparUsuario, senhaFraca, somarDias, limitesMes, r2, soma, FORMAS, pagDe, pctComissao,
     toHora(m) { return String(Math.floor(m / 60)).padStart(2, '0') + ':' + String(m % 60).padStart(2, '0'); },
     iso(d) { return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0'); },
     hojeISO() { return U.iso(new Date()); },
@@ -176,7 +202,7 @@ function resumoFinanceiro(barbeiros, ags, pags, ant) {
   };
 
   // ------------------------------------------------- modo demonstração
-  const CHAVE = 'barbearia_demo_v2';
+  const CHAVE = 'barbearia_demo_v3';
   let mem = null;
   const ERRO = msg => Promise.reject(new Error(msg));
 
@@ -195,9 +221,9 @@ function resumoFinanceiro(barbeiros, ags, pags, ant) {
       s('Corte + barba', 60, 70, 'O combo completo'), s('Sobrancelha', 15, 15), s('Pezinho', 15, 20, 'Acabamento entre cortes'),
       s('Pigmentação', 30, 40),
     ];
-    const b1 = { id: novoId(), nome: 'Rafael', bio: 'Degradê e cortes clássicos', foto: '', ativo: true, ordem: 0, comissao: 50, servicos: [], horarios: semana(), senhaDemo: '1234' };
+    const b1 = { id: novoId(), nome: 'Rafael', bio: 'Degradê e cortes clássicos', foto: '', ativo: true, ordem: 0, comissao: 50, servicos: [], horarios: semana(), usuario: 'rafael', senhaDemo: 'barba1' };
     const h2 = semana(); h2[1].aberto = false;
-    const b2 = { id: novoId(), nome: 'Lucas', bio: 'Barba e navalha', foto: '', ativo: true, ordem: 1, comissao: 40, servicos: servicos.slice(0, 5).map(x => x.id), horarios: h2, senhaDemo: '1234' };
+    const b2 = { id: novoId(), nome: 'Lucas', bio: 'Barba e navalha', foto: '', ativo: true, ordem: 1, comissao: 40, servicos: servicos.slice(0, 5).map(x => x.id), horarios: h2, usuario: 'lucas', senhaDemo: 'barba1' };
     const hoje = U.hojeISO(), agora = U.agoraMin();
     const nomes = ['Carlos Mendes', 'João Pedro', 'André Silva', 'Marcos Lima', 'Felipe Costa', 'Bruno Alves', 'Diego Rocha', 'Gustavo Reis', 'Thiago Nunes', 'Vinícius Prado', 'Rodrigo Melo', 'Leandro Dias', 'Paulo Henrique', 'Eduardo Faria', 'Igor Matos'];
     const tels = nomes.map((_, i) => '4199' + String(1000000 + i * 73331).slice(0, 7));
@@ -248,7 +274,7 @@ function resumoFinanceiro(barbeiros, ags, pags, ant) {
         instagram: 'barbeariamodelo', sobre: 'Ambiente climatizado, café por nossa conta e Wi-Fi liberado. Aceitamos Pix e cartões.',
         grade: 15, antecedencia: 60, diasAFrente: 30, fuso: 'America/Sao_Paulo',
       },
-      servicos, barbeiros: [b1, b2], pagamentos,
+      servicos, barbeiros: [b1, b2], pagamentos, tentativas: {},
       bloqueios: [{ id: novoId(), barbeiroId: b2.id, data: somarDias(hoje, 4), dataFim: somarDias(hoje, 4), diaInteiro: true, inicio: '', fim: '', motivo: 'Folga' }],
       agendamentos,
     };
@@ -262,7 +288,7 @@ function resumoFinanceiro(barbeiros, ags, pags, ant) {
   const copia = x => JSON.parse(JSON.stringify(x));
   const ok = v => new Promise(r => setTimeout(() => r(copia(v)), 100));
   const tenta = fn => { try { return ok(fn()); } catch (e) { return Promise.reject(e); } };
-  const semAcesso = (b, admin) => { const { senhaDemo, ...r } = b; return admin ? { ...r, temAcesso: !!senhaDemo } : r; };
+  const semAcesso = (b, admin) => { const { senhaDemo, ...r } = b; if (!admin) { delete r.usuario; delete r.ultimoAcesso; return r; } const t = (db().tentativas || {})['barb:' + b.usuario]; return { ...r, temAcesso: !!senhaDemo, bloqueadoAte: t && t.bloqueadoAte > Date.now() ? t.bloqueadoAte : 0 }; };
   const semAnexos = a => { const { anexos, obsInterna, ...r } = a; return { ...r, qtdAnexos: (anexos || []).length }; };
   const achar = id => { const a = db().agendamentos.find(x => x.id === id); if (!a) throw new Error('Agendamento não encontrado.'); return a; };
   const trocar = n => { const D = db(); D.agendamentos[D.agendamentos.findIndex(x => x.id === n.id)] = n; gravar(); return n; };
@@ -351,12 +377,24 @@ function resumoFinanceiro(barbeiros, ags, pags, ant) {
     async login(d) {
       const papel = d.papel === 'barb' ? 'barb' : 'adm';
       if (DEMO) {
-        if (papel === 'adm') { if (d.senha !== 'admin') throw new Error('Senha incorreta. Na demonstração a senha é: admin'); gravarSess('adm', { token: 'demo', nome: 'Administrador' }, d.lembrar); return; }
-        const b = db().barbeiros.find(x => x.id === d.barbeiroId && x.ativo);
-        if (!b || !b.senhaDemo || b.senhaDemo !== d.senha) throw new Error('Barbeiro ou senha incorretos. Na demonstração a senha é: 1234');
-        gravarSess('barb', { token: 'demo', id: b.id, nome: b.nome }, d.lembrar); return;
+        const D = db(), agora = Date.now(); D.tentativas = D.tentativas || {};
+        const usuario = limparUsuario(d.usuario), chave = papel === 'barb' ? 'barb:' + usuario : 'adm';
+        const t0 = D.tentativas[chave];
+        if (t0 && t0.bloqueadoAte > agora) throw new Error(msgBloqueio(t0.bloqueadoAte, agora));
+        const b = papel === 'barb' ? D.barbeiros.find(x => x.usuario === usuario && x.ativo && x.senhaDemo) : null;
+        const ok = papel === 'adm' ? d.senha === 'admin' : !!(b && b.senhaDemo === d.senha);
+        if (!ok) {
+          const c = avaliarFalha(t0, agora, 5); D.tentativas[chave] = c.t; gravar();
+          await new Promise(r => setTimeout(r, 400));
+          if (c.t.bloqueadoAte > agora) throw new Error(msgBloqueio(c.t.bloqueadoAte, agora));
+          throw new Error((papel === 'adm' ? 'Senha incorreta.' : 'Usuário ou senha incorretos.') + (c.restantes <= 2 ? ` Mais ${c.restantes} erro(s) e o acesso será bloqueado por um tempo.` : '') + (papel === 'adm' ? ' (demonstração: admin)' : ' (demonstração: rafael / barba1)'));
+        }
+        delete D.tentativas[chave];
+        if (b) b.ultimoAcesso = new Date().toISOString();
+        gravar();
+        gravarSess(papel, papel === 'adm' ? { token: 'demo', nome: 'Administrador' } : { token: 'demo', id: b.id, nome: b.nome }, d.lembrar); return;
       }
-      const r = await req('POST', '/api/login', { papel, senha: d.senha, barbeiroId: d.barbeiroId });
+      const r = await req('POST', '/api/login', { papel, senha: d.senha, usuario: d.usuario, lembrar: !!d.lembrar });
       gravarSess(papel, { token: r.token, id: r.id, nome: r.nome }, d.lembrar);
     },
 
@@ -424,12 +462,19 @@ function resumoFinanceiro(barbeiros, ags, pags, ant) {
           const { novaSenha, removerAcesso, temAcesso, ...n } = b;
           if (!n.id) n.id = novoId();
           n.comissao = pctComissao(n);
+          delete n.bloqueadoAte;
+          n.usuario = limparUsuario(n.usuario);
           if (antigo && antigo.senhaDemo) n.senhaDemo = antigo.senhaDemo;
-          if (novaSenha) { if (String(novaSenha).length < 4) throw new Error('A senha do barbeiro precisa ter pelo menos 4 caracteres.'); n.senhaDemo = String(novaSenha); }
+          if (antigo && antigo.ultimoAcesso) n.ultimoAcesso = antigo.ultimoAcesso;
+          if (n.usuario && n.usuario.length < 3) throw new Error('O usuário precisa ter pelo menos 3 letras ou números.');
+          const outro = n.usuario && D.barbeiros.find(x => x.usuario === n.usuario && x.id !== n.id);
+          if (outro) throw new Error(`O usuário "${n.usuario}" já é do ${outro.nome}. Escolha outro.`);
+          if (novaSenha) { const fraca = senhaFraca(novaSenha); if (fraca) throw new Error(fraca); if (!n.usuario) throw new Error('Defina o usuário de acesso junto com a senha.'); n.senhaDemo = String(novaSenha); }
           if (removerAcesso) delete n.senhaDemo;
           upsert(D.barbeiros, n); gravar(); return semAcesso(n, true);
         });
       },
+      desbloquear(id) { if (!DEMO) return adm('POST', `/api/admin/barbeiros/${id}/desbloquear`); const D = db(), b = D.barbeiros.find(x => x.id === id); if (b && D.tentativas) delete D.tentativas['barb:' + b.usuario]; gravar(); return ok({ ok: true }); },
       excluirBarbeiro(id) {
         if (!DEMO) return adm('DELETE', '/api/admin/barbeiros/' + id);
         const D = db(), hoje = U.hojeISO(); let n = 0;

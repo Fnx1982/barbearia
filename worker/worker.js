@@ -1,5 +1,5 @@
 // =====================================================================
-//  BARBEARIA — Backend (Cloudflare Worker + D1 + R2)   versão 2
+//  BARBEARIA — Backend (Cloudflare Worker + D1 + R2)   versão 3
 //  Cole este arquivo inteiro no editor do Worker.
 //  Bindings / variáveis necessários:
 //    • D1  →  nome da variável:  DB
@@ -21,7 +21,11 @@ const SCHEMA = [
   `CREATE INDEX IF NOT EXISTS idx_ag_tel ON agendamentos (telefone)`,
   `CREATE INDEX IF NOT EXISTS idx_bl_data ON bloqueios (data, data_fim)`,
   `CREATE INDEX IF NOT EXISTS idx_pg_data ON pagamentos (data)`,
+  `CREATE TABLE IF NOT EXISTS tentativas (chave TEXT PRIMARY KEY, dados TEXT NOT NULL, ultima INTEGER NOT NULL)`,
 ];
+const LIMITE_CONTA = 5;   // erros seguidos por usuário (ou admin por IP) até bloquear
+const LIMITE_IP = 20;     // erros por IP (qualquer usuário) em 15 min até bloquear o IP
+const LIMITE_AGENDA_IP = 10; // agendamentos pelo site por IP por hora
 
 const CONFIG_PADRAO = {
   nome: 'Sua Barbearia', slogan: 'Corte, barba e cuidado — com hora marcada.', logo: '',
@@ -177,6 +181,32 @@ function resumoFinanceiro(barbeiros, ags, pags, ant) {
   }).filter(r => r.atendimentos || r.pago || r.anterior || barbeiros.some(b => b.id === r.barbeiroId && b.ativo))
     .sort((x, y) => y.produzido - x.produzido);
 }
+// --- segurança de login: bloqueio progressivo por tentativas erradas ---
+const NIVEIS_BLOQUEIO = [15, 60, 1440]; // minutos: 1º bloqueio 15 min, 2º 1 h, 3º em diante 24 h
+const JANELA_TENTATIVAS = 15 * 60000;
+function avaliarFalha(t, agora, limite) {
+  t = t ? { ...t } : { falhas: 0, janela: agora, nivel: 0, bloqueadoAte: 0, ultima: 0 };
+  if (agora - (t.ultima || 0) > 86400000) t.nivel = 0;
+  if (agora - t.janela > JANELA_TENTATIVAS) { t.falhas = 0; t.janela = agora; }
+  t.falhas++; t.ultima = agora;
+  let restantes = limite - t.falhas;
+  if (t.falhas >= limite) {
+    t.bloqueadoAte = agora + NIVEIS_BLOQUEIO[Math.min(t.nivel, NIVEIS_BLOQUEIO.length - 1)] * 60000;
+    t.nivel++; t.falhas = 0; t.janela = agora; restantes = 0;
+  }
+  return { t, restantes };
+}
+function msgBloqueio(ate, agora) {
+  const min = Math.max(1, Math.ceil((ate - agora) / 60000));
+  return 'Muitas tentativas erradas. Acesso bloqueado por ' + (min > 90 ? Math.ceil(min / 60) + ' horas' : min + ' minuto(s)') + '.';
+}
+function limparUsuario(u) { return String(u || '').trim().toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^a-z0-9._-]/g, '').slice(0, 30); }
+function senhaFraca(s) {
+  s = String(s || '');
+  if (s.length < 6) return 'A senha precisa ter pelo menos 6 caracteres.';
+  if (/^(\d)\1+$/.test(s) || ['123456', '1234567', '12345678', '654321', '000000', '111111', 'senha123', 'abc123', 'qwerty'].includes(s.toLowerCase())) return 'Senha fácil demais. Evite sequências e números repetidos.';
+  return '';
+}
 // ===== fim das regras compartilhadas =====
 
 
@@ -217,7 +247,7 @@ async function rotear(req, env) {
   const m = req.method;
   const q = k => url.searchParams.get(k) || '';
 
-  if (p === '' || p === '/api') return { ok: true, sistema: 'barbearia', versao: 2 };
+  if (p === '' || p === '/api') return { ok: true, sistema: 'barbearia', versao: 3 };
 
   // ---------- público ----------
   if (p === '/api/publico' && m === 'GET') {
@@ -228,21 +258,54 @@ async function rotear(req, env) {
     if (!ehData(q('data'))) throw new Erro('Data inválida.');
     return ocupadosDoDia(env, q('data'));
   }
-  if (p === '/api/agendamentos' && m === 'POST') return criarAgendamento(env, await lerJSON(req), false);
+  if (p === '/api/agendamentos' && m === 'POST') {
+    const agora = Date.now(), chave = 'ag:' + (req.headers.get('CF-Connecting-IP') || 'sem-ip');
+    const t = await lerTentativa(env, chave);
+    const n = t && agora - t.janela < 3600000 ? t : { janela: agora, n: 0 };
+    if (n.n >= LIMITE_AGENDA_IP) throw new Erro('Muitos agendamentos feitos deste aparelho. Tente mais tarde ou fale com a barbearia.', 429);
+    const ag = await criarAgendamento(env, await lerJSON(req), false);
+    await gravarTentativa(env, chave, { ...n, n: n.n + 1, ultima: agora });
+    return ag;
+  }
 
   if (p === '/api/login' && m === 'POST') {
     const d = await lerJSON(req);
     if (!env.ADMIN_PASSWORD) throw new Erro('Configure o secret ADMIN_PASSWORD no Worker.', 500);
-    if (d.papel === 'barb') {
-      const b = await lerUm(env, 'barbeiros', String(d.barbeiroId || ''));
-      const ok = b && b.ativo && b.acesso && (await hashSenha(String(d.senha || ''), b.acesso.salt)) === b.acesso.hash;
-      if (!ok) { await esperar(600); throw new Erro('Barbeiro ou senha incorretos.', 401); }
-      return { token: await gerarToken(env, 'barb', b.id, b.acesso.salt.slice(0, 8)), nome: b.nome, id: b.id };
+    const agora = Date.now(), ip = req.headers.get('CF-Connecting-IP') || 'sem-ip';
+    const barb = d.papel === 'barb';
+    const usuario = limparUsuario(d.usuario);
+    const chaveConta = barb ? 'barb:' + usuario : 'adm:' + ip, chaveIp = 'ip:' + ip;
+    for (const k of [chaveIp, chaveConta]) {
+      const t = await lerTentativa(env, k);
+      if (t && t.bloqueadoAte > agora) throw new Erro(msgBloqueio(t.bloqueadoAte, agora), 429);
     }
-    const a = await hmac(env.ADMIN_PASSWORD, 'senha:' + String(d.senha || ''));
-    const b = await hmac(env.ADMIN_PASSWORD, 'senha:' + env.ADMIN_PASSWORD);
-    if (a !== b) { await esperar(600); throw new Erro('Senha incorreta.', 401); }
-    return { token: await gerarToken(env, 'adm', '-', 'a'), nome: 'Administrador' };
+    const senha = String(d.senha || '').slice(0, 100);
+    let ok = false, b = null;
+    if (barb) {
+      b = usuario ? (await lerTodos(env, 'barbeiros')).find(x => x.usuario === usuario) : null;
+      const salt = b && b.acesso ? b.acesso.salt : 'sal-falso-para-tempo-igual';
+      const h = await hashSenha(senha, salt);
+      ok = !!(b && b.ativo && b.acesso && h === b.acesso.hash);
+    } else {
+      ok = (await hmac(env.ADMIN_PASSWORD, 'senha:' + senha)) === (await hmac(env.ADMIN_PASSWORD, 'senha:' + env.ADMIN_PASSWORD));
+    }
+    if (!ok) {
+      const c = avaliarFalha(await lerTentativa(env, chaveConta), agora, LIMITE_CONTA);
+      const i = avaliarFalha(await lerTentativa(env, chaveIp), agora, LIMITE_IP);
+      await Promise.all([gravarTentativa(env, chaveConta, c.t), gravarTentativa(env, chaveIp, i.t)]);
+      await env.DB.prepare('DELETE FROM tentativas WHERE ultima < ?').bind(agora - 3 * 86400000).run();
+      await esperar(500);
+      const bloq = [c.t, i.t].find(t => t.bloqueadoAte > agora);
+      if (bloq) throw new Erro(msgBloqueio(bloq.bloqueadoAte, agora), 429);
+      throw new Erro((barb ? 'Usuário ou senha incorretos.' : 'Senha incorreta.') + (c.restantes <= 2 ? ` Mais ${c.restantes} erro(s) e o acesso será bloqueado por um tempo.` : ''), 401);
+    }
+    await env.DB.prepare('DELETE FROM tentativas WHERE chave = ?').bind(chaveConta).run();
+    if (barb) {
+      b.ultimoAcesso = new Date().toISOString();
+      await salvarLinha(env, 'barbeiros', b);
+      return { token: await gerarToken(env, 'barb', b.id, b.acesso.salt.slice(0, 8), d.lembrar ? 7 * 24 : 12), nome: b.nome, id: b.id };
+    }
+    return { token: await gerarToken(env, 'adm', '-', 'a', 8), nome: 'Administrador' };
   }
 
   // ---------- área do barbeiro ----------
@@ -294,7 +357,10 @@ async function rotear(req, env) {
         lerTodos(env, 'servicos'), lerTodos(env, 'barbeiros'),
         env.DB.prepare('SELECT dados FROM bloqueios WHERE data_fim >= ? ORDER BY data').bind(limite).all(),
       ]);
-      return { config, servicos, barbeiros: barbeiros.map(b => publicoBarbeiro(b, true)), bloqueios: bl.results.map(r => JSON.parse(r.dados)) };
+      const tent = await env.DB.prepare(`SELECT chave, dados FROM tentativas WHERE chave LIKE 'barb:%'`).all();
+      const bloq = {}; const agora = Date.now();
+      tent.results.forEach(r => { const t = JSON.parse(r.dados); if (t.bloqueadoAte > agora) bloq[r.chave.slice(5)] = t.bloqueadoAte; });
+      return { config, servicos, barbeiros: barbeiros.map(b => ({ ...publicoBarbeiro(b, true), bloqueadoAte: bloq[b.usuario] || 0 })), bloqueios: bl.results.map(r => JSON.parse(r.dados)) };
     }
 
     if (rec === 'agendamentos' && !id && m === 'GET') {
@@ -403,22 +469,35 @@ async function rotear(req, env) {
       await env.DB.prepare('DELETE FROM servicos WHERE id = ?').bind(id).run();
       return { ok: true };
     }
-    if (rec === 'barbeiros' && m === 'POST') {
+    if (rec === 'barbeiros' && !id && m === 'POST') {
       const d = await lerJSON(req);
       const b = limparBarbeiro(d);
       const antigo = d.id ? await lerUm(env, 'barbeiros', b.id) : null;
       if (antigo && antigo.acesso) b.acesso = antigo.acesso;
+      if (antigo && antigo.ultimoAcesso) b.ultimoAcesso = antigo.ultimoAcesso;
+      if (b.usuario) {
+        if (b.usuario.length < 3) throw new Erro('O usuário precisa ter pelo menos 3 letras ou números.');
+        const outro = (await lerTodos(env, 'barbeiros')).find(x => x.usuario === b.usuario && x.id !== b.id);
+        if (outro) throw new Erro(`O usuário "${b.usuario}" já é do ${outro.nome}. Escolha outro.`);
+      }
       if (d.novaSenha) {
-        const senha = String(d.novaSenha);
-        if (senha.length < 4) throw new Erro('A senha do barbeiro precisa ter pelo menos 4 caracteres.');
+        const fraca = senhaFraca(d.novaSenha);
+        if (fraca) throw new Erro(fraca);
+        if (!b.usuario) throw new Erro('Defina o usuário de acesso junto com a senha.');
         const salt = novoId() + novoId();
-        b.acesso = { salt, hash: await hashSenha(senha, salt) };
+        b.acesso = { salt, hash: await hashSenha(String(d.novaSenha), salt) };
       }
       if (d.removerAcesso) delete b.acesso;
+      if (antigo && antigo.usuario && antigo.usuario !== b.usuario) await env.DB.prepare('DELETE FROM tentativas WHERE chave = ?').bind('barb:' + antigo.usuario).run();
       await salvarLinha(env, 'barbeiros', b);
       return publicoBarbeiro(b, true);
     }
-    if (rec === 'barbeiros' && id && m === 'DELETE') {
+    if (rec === 'barbeiros' && id && sub === 'desbloquear' && m === 'POST') {
+      const b = await lerUm(env, 'barbeiros', id);
+      if (b && b.usuario) await env.DB.prepare('DELETE FROM tentativas WHERE chave = ?').bind('barb:' + b.usuario).run();
+      return { ok: true };
+    }
+    if (rec === 'barbeiros' && id && !sub && m === 'DELETE') {
       const fut = await env.DB.prepare(`SELECT id, dados FROM agendamentos WHERE barbeiro_id = ? AND data >= ? AND status = 'confirmado'`).bind(id, hoje).all();
       const ops = fut.results.map(r => {
         const ag = mudarStatus(JSON.parse(r.dados), 'cancelado');
@@ -524,7 +603,7 @@ async function gravarAgendamento(env, ag) {
 function semAnexos(a) { const { anexos, obsInterna, ...resto } = a; return { ...resto, qtdAnexos: (anexos || []).length }; }
 function publicoBarbeiro(b, admin) {
   const { acesso, ...resto } = b;
-  if (!admin) { delete resto.comissao; return resto; }
+  if (!admin) { delete resto.comissao; delete resto.usuario; delete resto.ultimoAcesso; return resto; }
   return { ...resto, temAcesso: !!acesso };
 }
 
@@ -570,7 +649,7 @@ function limparBarbeiro(b) {
   });
   return {
     id: txt(b.id, 40) || novoId(), nome, bio: txt(b.bio, 140), foto: imagem(b.foto, 250000),
-    ativo: !!b.ativo, ordem: parseInt(b.ordem, 10) || 0, comissao: pctComissao(b),
+    ativo: !!b.ativo, ordem: parseInt(b.ordem, 10) || 0, comissao: pctComissao(b), usuario: limparUsuario(b.usuario),
     servicos: Array.isArray(b.servicos) ? b.servicos.map(x => txt(x, 40)).filter(Boolean).slice(0, 100) : [],
     horarios,
   };
@@ -634,8 +713,8 @@ async function hashSenha(senha, salt) {
   const k = await crypto.subtle.importKey('raw', enc(senha), 'PBKDF2', false, ['deriveBits']);
   return hex(await crypto.subtle.deriveBits({ name: 'PBKDF2', salt: enc(salt), iterations: 100000, hash: 'SHA-256' }, k, 256));
 }
-async function gerarToken(env, papel, id, ver) {
-  const exp = Date.now() + (papel === 'adm' ? 12 : 72) * 3600 * 1000;
+async function gerarToken(env, papel, id, ver, horas) {
+  const exp = Date.now() + horas * 3600 * 1000;
   const base = `${exp}.${papel}.${id}.${ver}`;
   return base + '.' + (await hmac(env.ADMIN_PASSWORD, base));
 }
@@ -654,6 +733,14 @@ async function sessao(env, req, papel) {
     return { papel, barbeiro: b };
   }
   return { papel };
+}
+
+async function lerTentativa(env, chave) {
+  const r = await env.DB.prepare('SELECT dados FROM tentativas WHERE chave = ?').bind(chave).first();
+  return r ? JSON.parse(r.dados) : null;
+}
+async function gravarTentativa(env, chave, t) {
+  await env.DB.prepare('INSERT OR REPLACE INTO tentativas (chave, dados, ultima) VALUES (?, ?, ?)').bind(chave, JSON.stringify(t), t.ultima || Date.now()).run();
 }
 
 // ------------------------------------------------------------ utilidades

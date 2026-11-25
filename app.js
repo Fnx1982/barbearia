@@ -413,18 +413,18 @@
     app.innerHTML = `<div class="login"><form class="card login-card" id="login" novalidate>
       <div class="login-marca">${logoHTML(pub.config)}</div>
       <h1>Área do barbeiro</h1>
-      <label>Quem é você?<select name="barb" required><option value="">Escolha seu nome</option>${pub.barbeiros.map(b => `<option value="${esc(b.id)}">${esc(b.nome)}</option>`).join('')}</select></label>
-      <label>Senha<input type="password" name="senha" autocomplete="current-password" required></label>
-      <label class="check"><input type="checkbox" name="lembrar" checked> Manter conectado neste aparelho</label>
+      <label>Usuário<input name="usuario" autocomplete="username" autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="30" required></label>
+      <label>Senha<input type="password" name="senha" autocomplete="current-password" maxlength="100" required></label>
+      <label class="check"><input type="checkbox" name="lembrar"> Manter conectado por 7 dias <small>(só no seu celular)</small></label>
       <button class="btn btn-g" type="submit">Entrar</button>
-      ${Api.demo ? '<p class="ajuda">Demonstração: a senha dos barbeiros é <b>1234</b>.</p>' : '<p class="ajuda">Sem senha? Peça para a gerência cadastrar no painel.</p>'}
+      ${Api.demo ? '<p class="ajuda">Demonstração: usuário <b>rafael</b> ou <b>lucas</b>, senha <b>barba1</b>.</p>' : '<p class="ajuda">Esqueceu a senha ou foi bloqueado? Fale com a gerência.</p>'}
       <a class="link" href="#inicio">← Voltar ao site</a></form></div>`;
-    const f = $('#login');
+    const f = $('#login'); f.usuario.focus();
     f.addEventListener('submit', async e => {
       e.preventDefault();
-      if (!f.barb.value) return toast('Escolha seu nome.', 'erro');
+      if (!f.usuario.value.trim() || !f.senha.value) return toast('Informe usuário e senha.', 'erro');
       const b = f.querySelector('button'); b.disabled = true;
-      try { await Api.login({ papel: 'barb', barbeiroId: f.barb.value, senha: f.senha.value, lembrar: f.lembrar.checked }); abrirBarbeiro(); }
+      try { await Api.login({ papel: 'barb', usuario: f.usuario.value, senha: f.senha.value, lembrar: f.lembrar.checked }); abrirBarbeiro(); }
       catch (err) { toast(err.message, 'erro'); f.senha.select(); }
       b.disabled = false;
     });
@@ -572,7 +572,7 @@
     app.innerHTML = `<div class="login"><form class="card login-card" id="login" novalidate>
       <div class="login-marca"><span class="logo logo-vazia">${poste()}</span></div>
       <h1>Painel da barbearia</h1>
-      <label>Senha do administrador<input type="password" name="senha" autocomplete="current-password" required></label>
+      <label>Senha do administrador<input type="password" name="senha" autocomplete="current-password" maxlength="100" required></label>
       <button class="btn btn-g" type="submit">Entrar</button>
       ${Api.demo ? '<p class="ajuda">Demonstração: a senha é <b>admin</b>.</p>' : ''}
       <p class="ajuda">É barbeiro? <a href="#barbeiro">Entre pela área do barbeiro</a>.</p>
@@ -950,13 +950,15 @@
       ${bs.length ? `<div class="cards">${bs.map(b => `<article class="card cb${b.ativo ? '' : ' inativo'}">
         ${avatar(b, 'av av-g')}<div><h3>${esc(b.nome)}</h3>${b.bio ? `<p>${esc(b.bio)}</p>` : ''}
         <p class="mini">${ORDEM_SEMANA.filter(i => b.horarios[i] && b.horarios[i].aberto).map(i => DIAS_C[i]).join(' · ') || 'Sem dias de atendimento'}</p>
-        <p class="mini">Comissão ${U.pctComissao(b)}% · ${b.temAcesso ? 'Acesso liberado' : '<b>Sem senha de acesso</b>'}${b.ativo ? '' : ' · <b>inativo</b>'}</p></div>
+        <p class="mini">Comissão ${U.pctComissao(b)}% · ${b.usuario && b.temAcesso ? `usuário <b>${esc(b.usuario)}</b>` : '<b>Sem usuário/senha de acesso</b>'}${b.ativo ? '' : ' · <b>inativo</b>'}</p>
+        ${b.bloqueadoAte ? `<p class="mini bloq">Bloqueado por senha errada até ${new Date(b.bloqueadoAte).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })} <button class="link" type="button" data-desb="${esc(b.id)}">Desbloquear</button></p>` : ''}</div>
         <div class="cb-acoes"><button class="btn btn-sec btn-sm" data-ed="${esc(b.id)}" type="button">Editar</button><button class="btn btn-sec btn-sm perigo" data-ex="${esc(b.id)}" type="button">Excluir</button></div></article>`).join('')}</div>`
         : '<p class="vazio">Nenhum barbeiro cadastrado.</p>'}
-      <p class="ajuda">Cada barbeiro entra em <b>${esc(location.href.split('#')[0])}#barbeiro</b> com a senha que você definir aqui.</p>`;
+      <p class="ajuda">Cada barbeiro entra em <b>${esc(location.href.split('#')[0])}#barbeiro</b> com o usuário e a senha definidos aqui. Depois de 5 senhas erradas o acesso dele fica bloqueado (15 min, depois 1 h, depois 24 h); você pode desbloquear por aqui.</p>`;
     $('#novo-b').onclick = () => modalBarbeiro();
     $('#adm-main').onclick = e => {
-      const ed = e.target.closest('[data-ed]'), ex = e.target.closest('[data-ex]');
+      const ed = e.target.closest('[data-ed]'), ex = e.target.closest('[data-ex]'), db = e.target.closest('[data-desb]');
+      if (db) return seguro(async () => { await Api.admin.desbloquear(db.dataset.desb); await recarregar(); abaBarbeiros(); toast('Acesso desbloqueado.'); });
       if (ed) modalBarbeiro(bs.find(b => b.id === ed.dataset.ed));
       if (ex) {
         const b = bs.find(x => x.id === ex.dataset.ex);
@@ -980,10 +982,12 @@
         <label>Comissão (%)<input name="comissao" type="number" min="0" max="100" step="0.5" value="${U.pctComissao(b)}" required></label>
         <label class="check"><input type="checkbox" name="ativo"${b.ativo ? ' checked' : ''}> Ativo — aparece no site e recebe agendamentos</label>
       </div>
-      <h4>Acesso do barbeiro</h4>
+      <h4>Acesso à área do barbeiro</h4>
       <div class="campos">
-        <label>${b.temAcesso ? 'Nova senha <i>(em branco = manter a atual)</i>' : 'Senha de acesso <i>(mín. 4 caracteres)</i>'}<input name="senha" type="text" autocomplete="off" maxlength="40" placeholder="${b.temAcesso ? '••••' : 'Ex.: 4 números'}"></label>
-        ${b.temAcesso ? '<label class="check"><input type="checkbox" name="remover"> Bloquear acesso deste barbeiro</label>' : '<p class="ajuda">Sem senha, ele não entra na área do barbeiro.</p>'}
+        <label>Usuário <i>(login)</i><input name="usuario" maxlength="30" autocomplete="off" autocapitalize="none" spellcheck="false" value="${esc(b.usuario || '')}" placeholder="Ex.: rafael"></label>
+        <label>${b.temAcesso ? 'Nova senha <i>(em branco = manter)</i>' : 'Senha <i>(mín. 6 caracteres)</i>'}<input name="senha" type="text" autocomplete="new-password" maxlength="100" placeholder="${b.temAcesso ? '••••••' : 'Mín. 6 caracteres'}"></label>
+        ${b.temAcesso ? '<label class="check full"><input type="checkbox" name="remover"> Remover acesso (ele não consegue mais entrar)</label>' : '<p class="ajuda full">Sem usuário e senha, ele não entra na área do barbeiro.</p>'}
+        ${b.ultimoAcesso ? `<p class="ajuda full">Último acesso: ${fmtCurta(b.ultimoAcesso.slice(0, 10))} às ${new Date(b.ultimoAcesso).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })}. Trocar a senha desconecta ele de todos os aparelhos.</p>` : ''}
       </div>
       <h4>Serviços que realiza</h4><p class="ajuda">Nenhum marcado = faz todos.</p>
       <div class="checks">${A.D.servicos.map(s => `<label class="check"><input type="checkbox" name="bs" value="${esc(s.id)}"${b.servicos.includes(s.id) ? ' checked' : ''}> ${esc(s.nome)}</label>`).join('') || '<p class="vazio">Cadastre serviços primeiro.</p>'}</div>
@@ -998,19 +1002,22 @@
       aoAbrir(f) {
         $('#b-foto', f).onchange = async e => { try { b.foto = await lerImagem(e.target.files[0], 240); $('#b-prev', f).innerHTML = avatar(b, 'av av-xg'); } catch (err) { toast(err.message, 'erro'); } };
         $('#b-rem', f).onclick = () => { b.foto = ''; $('#b-prev', f).innerHTML = avatar({ ...b, nome: f.nome.value || b.nome }, 'av av-xg'); };
+        f.nome.addEventListener('input', () => { if (!b0 || !b0.usuario) f.usuario.value = U.limparUsuario(f.nome.value.split(' ')[0]); });
+        f.usuario.addEventListener('input', () => { const v = U.limparUsuario(f.usuario.value); if (v !== f.usuario.value) f.usuario.value = v; });
         $('#copiar-seg', f).onclick = () => { [2, 3, 4, 5].forEach(i => { ['ab', 'in', 'fi', 'pi', 'pf'].forEach(k => { const o = f[k + '1'], d = f[k + i]; if (k === 'ab') d.checked = o.checked; else d.value = o.value; }); }); toast('Copiado para terça a sexta.'); };
       },
       async aoEnviar(f) {
         if (!f.nome.value.trim()) throw new Error('Informe o nome.');
         const c = Number(f.comissao.value);
         if (!(c >= 0 && c <= 100)) throw new Error('Comissão entre 0 e 100%.');
-        const senha = f.senha.value.trim();
-        if (senha && senha.length < 4) throw new Error('A senha precisa ter pelo menos 4 caracteres.');
+        const senha = f.senha.value;
+        const usuario = U.limparUsuario(f.usuario.value);
+        if (senha) { const fraca = U.senhaFraca(senha); if (fraca) throw new Error(fraca); if (usuario.length < 3) throw new Error('Defina um usuário com pelo menos 3 letras ou números.'); }
         const horarios = [0, 1, 2, 3, 4, 5, 6].map(i => ({ aberto: f['ab' + i].checked, inicio: f['in' + i].value || '09:00', fim: f['fi' + i].value || '18:00', pausaInicio: f['pi' + i].value, pausaFim: f['pf' + i].value }));
         if (horarios.find(h => h.aberto && h.fim <= h.inicio)) throw new Error('Em algum dia o fim está antes do início.');
-        const { temAcesso, ...base } = b;
-        await Api.admin.salvarBarbeiro({ ...base, nome: f.nome.value.trim(), bio: f.bio.value.trim(), ativo: f.ativo.checked, comissao: c, servicos: $$('input[name=bs]:checked', f).map(i => i.value), horarios, novaSenha: senha || undefined, removerAcesso: f.remover ? f.remover.checked : false });
-        await recarregar(); abaBarbeiros(); toast(senha ? 'Barbeiro salvo. Passe a senha para ele.' : 'Barbeiro salvo.');
+        const { temAcesso, bloqueadoAte, ultimoAcesso, ...base } = b;
+        await Api.admin.salvarBarbeiro({ ...base, usuario, nome: f.nome.value.trim(), bio: f.bio.value.trim(), ativo: f.ativo.checked, comissao: c, servicos: $$('input[name=bs]:checked', f).map(i => i.value), horarios, novaSenha: senha || undefined, removerAcesso: f.remover ? f.remover.checked : false });
+        await recarregar(); abaBarbeiros(); toast(senha ? `Salvo. Passe para ele: usuário ${usuario} e a senha que você digitou.` : 'Barbeiro salvo.');
       },
     });
   }
